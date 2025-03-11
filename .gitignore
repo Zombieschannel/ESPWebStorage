@@ -1,0 +1,7 @@
+.devcontainer/
+.vscode/
+build/
+components/
+managed_components/
+wifi/
+site/
