@@ -7,7 +7,6 @@
 #include <iostream>
 #include <vector>
 #include <SPIFFS.h>
-#include <WiFi.h>
 #define HTTP_UPLOAD_BUFLEN 8192
 #define HTTP_RAW_BUFLEN 8192
 #include <WebServer.h>
@@ -15,9 +14,9 @@
 #include "nvs_flash.h"
 #include "Site.hpp"
 #include <ctime>
+#include <SPI.h>
+#include <ETH.h>
 using namespace std;
-
-#include "../../wifi/ssid_pass.txt" //const char *ssid = ""; //const char *password = "";
 
 unique_ptr<WebServer> server;
 void handleClients(void* data)
@@ -25,6 +24,7 @@ void handleClients(void* data)
     while (1)
     {
         server->handleClient();
+        delay(1);
     }
 }
 
@@ -32,6 +32,70 @@ uint64_t totalBytesStreamed = 0;
 File* processingFile = nullptr;
 bool done = true;
 JSON json;
+
+class DualCoreBuffer
+{
+    struct Data
+    {
+        vector<char> data;
+        bool valid = false;
+    };
+    
+    vector<Data> data;
+    uint8_t SDCore = 0;
+    uint8_t ETHCore = 0;
+public:
+    void Start()
+    {
+        data.resize(16);
+        for (int i = 0; i < data.size(); i++)
+            data[i].data.resize(8192);
+    }
+    bool SDFill()
+    {
+        if (data[SDCore].valid)
+            return false;
+        if (processingFile->size() < 32768)
+            return false;
+        if (!processingFile->available())
+        {
+            processingFile = nullptr;
+            return false;
+        }
+        // ESP_LOGE("WebServer", "Read %d", SDCore);
+        processingFile->readBytes(&data[SDCore].data[0], data[SDCore].data.size());
+        data[SDCore].valid = true;
+        SDCore++;
+        SDCore %= data.size();
+        return true;
+    }
+    void ETHSend()
+    {
+        if (!data[ETHCore].valid)
+        {
+            delay(1);
+            return;
+        }
+        // ESP_LOGE("WebServer", "Send %d", ETHCore);
+        server->sendContent(&data[ETHCore].data[0], data[ETHCore].data.size());
+        data[ETHCore].valid = false;
+        ETHCore++;
+        ETHCore %= data.size();
+    }
+    bool same()
+    {
+        return ETHCore == SDCore;
+    }
+    void reset()
+    {
+        ETHCore = 0;
+        SDCore = 0;
+        for (int i = 0; i < data.size(); i++)
+            data[i].valid = false;
+    }
+};
+
+DualCoreBuffer dcb;
 
 static const unsigned char upload[] =
 {
@@ -142,27 +206,49 @@ StorageServer()
     {
         uint64_t Clock = millis();
         setCpuFrequencyMhz(240);
-        File f = SD_MMC.open(fileName.c_str(), "r");
-
+        
         if (download)
             server->sendHeader("Content-Disposition", String("attachment;filename=") + fileName.substr(fileName.rfind("/") + 1).c_str(), true);
 
+        File f = SD_MMC.open(fileName.c_str(), "r");
         processingFile = &f;
         done = false;
-        if (fileName.ends_with(".JPG"))
-            server->streamFile(f, "image/jpeg");
-        else if (fileName.ends_with(".PNG"))
-            server->streamFile(f, "image/png");
-        else if (fileName.ends_with(".MP4"))
-            server->streamFile(f, "image/mp4");
-        else
-            server->streamFile(f, "image/application/octet-stream"); 
 
+        if (f.size() < 32768)
+        {
+            if (fileName.ends_with(".JPG"))
+                server->streamFile(f, "image/jpeg");
+            else if (fileName.ends_with(".PNG"))
+                server->streamFile(f, "image/png");
+            else if (fileName.ends_with(".MP4"))
+                server->streamFile(f, "image/mp4");
+            else
+                server->streamFile(f, "image/application/octet-stream");
+        }
+        else
+        {
+            server->setContentLength(f.size());
+
+            if (fileName.ends_with(".JPG"))
+                server->send(200, "image/jpeg", "");
+            else if (fileName.ends_with(".PNG"))
+                server->send(200, "image/png", "");
+            else if (fileName.ends_with(".MP4"))
+                server->send(200, "image/mp4", "");
+            else
+                server->send(200, "image/application/octet-stream", "");
+            
+            while (true)
+            {
+                dcb.ETHSend();
+                if (!processingFile && dcb.same())
+                    break;
+            }
+            dcb.reset();
+        }
         setCpuFrequencyMhz(80);
         ESP_LOGE("WebServer", "%s Time: %.2f", fileName.c_str(), (millis() - Clock) / 1000.f);
         done = true;
-        delay(10);
-        processingFile = nullptr;
     }
     static void page_notFound()
     {
@@ -398,8 +484,7 @@ StorageServer()
         SD_MMC.setPins(9, 10, 8, 7, 18, 17);
         if (!SD_MMC.begin("/sd", false, false, 40000))
             ESP_LOGE("WebServer", "Failed to init SD card!");
-
-
+        
         /*string data;
         data.resize(512);
         File f = SD_MMC.open("/server/testing/DSC02221.JPG");
@@ -418,13 +503,18 @@ StorageServer()
         display->setTextColor(1);
         display->cp437(false);
 
-        WiFi.begin(ssid, password);
-        while (WiFi.status() != WL_CONNECTED)
-        {
-            delay(10);
-            display->print(".");
-            display->display();
-        }
+        SPIClass ethernet(HSPI);
+        ethernet.begin(2, 38, 1, -1);
+        ETH.begin(ETH_PHY_W5500, ETH_PHY_ADDR_AUTO, 3, 4, -1, ethernet, 40);
+        // WiFi.begin(ssid, password);
+        // while (WiFi.status() != WL_CONNECTED)
+        // {
+        //     delay(10);
+        //     display->print(".");
+        //     display->display();
+        // }
+
+        dcb.Start();
 
         server = make_unique<WebServer>(80);
         server->onNotFound(StorageServer::page_notFound);
@@ -446,8 +536,12 @@ StorageServer()
         {
             if (!done)
             {
-                offset = processingFile->position();
-                size = processingFile->size();
+                if (processingFile)
+                {
+                    offset = processingFile->position();
+                    size = processingFile->size();
+                    while (dcb.SDFill()) {}
+                }   
             }
             else
             {
@@ -477,7 +571,7 @@ StorageServer()
                 display->setTextSize(1);
                 display->setCursor(0, 0);
                 if (done)
-                    display->println(WiFi.localIP());
+                    display->println(ETH.localIP());
                 else
                     display->printf("%ld KB/s", uploadSpeed / 1000);
                 display->setCursor(103, 0);
