@@ -16,6 +16,7 @@
 #include <ctime>
 #include <SPI.h>
 #include <ETH.h>
+#include <WiFi.h>
 using namespace std;
 
 unique_ptr<WebServer> server;
@@ -144,6 +145,7 @@ class StorageServer
 {
     TwoWire wire;
     unique_ptr<Adafruit_SSD1306> display;
+    bool wifiActive = false;
 public:
 StorageServer()
         : wire(Wire)
@@ -506,13 +508,13 @@ StorageServer()
         SPIClass ethernet(HSPI);
         ethernet.begin(2, 38, 1, -1);
         ETH.begin(ETH_PHY_W5500, ETH_PHY_ADDR_AUTO, 3, 4, -1, ethernet, 40);
-        // WiFi.begin(ssid, password);
-        // while (WiFi.status() != WL_CONNECTED)
-        // {
-        //     delay(10);
-        //     display->print(".");
-        //     display->display();
-        // }
+        WiFi.begin("LinkageR", "Default3R");
+        while (WiFi.status() != WL_CONNECTED)
+        {
+            delay(10);
+            display->print(".");
+            display->display();
+        }
 
         dcb.Start();
 
@@ -571,7 +573,12 @@ StorageServer()
                 display->setTextSize(1);
                 display->setCursor(0, 0);
                 if (done)
-                    display->println(ETH.localIP());
+                {
+                    if (ETH.localIP() != IPAddress("0.0.0.0"))
+                        display->println(ETH.localIP());
+                    else
+                        display->println(WiFi.localIP());
+                }
                 else
                     display->printf("%ld KB/s", uploadSpeed / 1000);
                 display->setCursor(103, 0);
